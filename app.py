@@ -287,18 +287,23 @@ body {
 }
 
 .product-brand {
-    margin-bottom: 0.25rem;
+    margin-bottom: 0.28rem;
     color: var(--rose-600);
-    font-size: 0.82rem;
+    font-size: 1.00rem;
     font-weight: 800;
-    letter-spacing: 0.06em;
+    letter-spacing: 0.035em;
     text-transform: uppercase;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .product-name {
     margin: 0;
-    font-size: 1.35rem;
-    line-height: 1.3;
+    color: #655a62;
+    font-size: 0.94rem;
+    font-weight: 650;
+    line-height: 1.42;
 }
 
 .score-pill {
@@ -987,6 +992,895 @@ def result_card(
     )
 
 
+
+# ---------------------------------------------------------------------------
+# E-COMMERCE DEMO HELPERS
+# ---------------------------------------------------------------------------
+
+CATEGORY_TABS = {
+    "all": "Tümü",
+    "makeup": "Makyaj",
+    "skincare": "Cilt Bakımı",
+    "sunscreen": "Güneş Kremleri",
+    "haircare": "Saç Bakımı",
+    "bodycare": "Vücut Bakımı",
+}
+
+
+def get_commerce_catalog(
+    influencer_slug: str,
+) -> list[dict[str, Any]]:
+    conditions: list[str] = []
+    params: list[Any] = []
+
+    if influencer_slug != "all":
+        conditions.append("influencer_slug = ?")
+        params.append(influencer_slug)
+
+    where = ""
+    if conditions:
+        where = "WHERE " + " AND ".join(conditions)
+
+    rows = fetch_all(
+        f"""
+        SELECT
+            product_id,
+            brand,
+            product_name,
+            category,
+            COUNT(*) AS comment_count,
+            COUNT(DISTINCT influencer_slug) AS influencer_count
+        FROM approved_product_comments
+        {where}
+        GROUP BY product_id, brand, product_name, category
+        ORDER BY
+            influencer_count DESC,
+            comment_count DESC,
+            brand COLLATE NOCASE,
+            product_name COLLATE NOCASE
+        """,
+        tuple(params),
+    )
+
+    return [
+        {
+            "product_id": int(row["product_id"]),
+            "brand": str(row["brand"] or "Marka belirtilmemiş"),
+            "product_name": str(row["product_name"]),
+            "category": str(row["category"]),
+            "comment_count": int(row["comment_count"]),
+            "influencer_count": int(row["influencer_count"]),
+        }
+        for row in rows
+    ]
+
+
+def get_product_by_id(product_id: int) -> dict[str, Any] | None:
+    rows = fetch_all(
+        """
+        SELECT
+            product_id,
+            brand,
+            product_name,
+            category,
+            COUNT(*) AS comment_count,
+            COUNT(DISTINCT influencer_slug) AS influencer_count
+        FROM approved_product_comments
+        WHERE product_id = ?
+        GROUP BY product_id, brand, product_name, category
+        """,
+        (product_id,),
+    )
+
+    if not rows:
+        return None
+
+    row = rows[0]
+    return {
+        "product_id": int(row["product_id"]),
+        "brand": str(row["brand"] or "Marka belirtilmemiş"),
+        "product_name": str(row["product_name"]),
+        "category": str(row["category"]),
+        "comment_count": int(row["comment_count"]),
+        "influencer_count": int(row["influencer_count"]),
+    }
+
+
+def product_matches_category(
+    product: dict[str, Any],
+    category_code: str,
+) -> bool:
+    if category_code == "all":
+        return True
+
+    if category_code == "sunscreen":
+        searchable = normalize_text(
+            f"{product['brand']} {product['product_name']} "
+            f"{search_aliases(product['brand'], product['product_name'], product['category'])}"
+        )
+        tokens = (
+            "gunes krem",
+            "gunes koruyucu",
+            "sun cream",
+            "suncream",
+            "sunscreen",
+            "sun protection",
+            "spf",
+        )
+        return any(token in searchable for token in tokens)
+
+    return product["category"] == category_code
+
+
+def browse_products(
+    influencer_slug: str,
+    category_code: str,
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    products = [
+        product
+        for product in get_commerce_catalog(influencer_slug)
+        if product_matches_category(product, category_code)
+    ]
+    return products[:limit]
+
+
+def search_products_commerce(
+    raw_query: str,
+    influencer_slug: str,
+    category_code: str,
+    *,
+    limit: int = 24,
+    score_cutoff: float = 48.0,
+) -> list[dict[str, Any]]:
+    catalog = [
+        product
+        for product in get_commerce_catalog(influencer_slug)
+        if product_matches_category(product, category_code)
+    ]
+    query = raw_query.strip()
+
+    if not query:
+        return []
+
+    if query.isdigit():
+        selected_id = int(query)
+        exact = [
+            {**product, "match_score": 100.0}
+            for product in catalog
+            if product["product_id"] == selected_id
+        ]
+        if exact:
+            return exact
+
+    scored = [
+        {
+            **product,
+            "match_score": calculate_match_score(query, product),
+        }
+        for product in catalog
+    ]
+    scored = [
+        product
+        for product in scored
+        if product["match_score"] >= score_cutoff
+    ]
+    scored.sort(
+        key=lambda item: (
+            -item["match_score"],
+            -item["influencer_count"],
+            -item["comment_count"],
+            item["brand"].casefold(),
+            item["product_name"].casefold(),
+        )
+    )
+    return scored[:limit]
+
+
+def js_set_input(input_name: str, payload: Any) -> str:
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return (
+        f"Shiny.setInputValue('{input_name}', {serialized}, "
+        "{priority: 'event'});"
+    )
+
+
+def payload_as_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    try:
+        return dict(value)
+    except (TypeError, ValueError):
+        return {}
+
+
+def product_initials(brand: str) -> str:
+    words = [
+        word
+        for word in re.split(r"\s+", brand.strip())
+        if word
+    ]
+    initials = "".join(word[0] for word in words[:2]).upper()
+    return initials or "SK"
+
+
+def review_entry(row: sqlite3.Row) -> Any:
+    evidence_texts = safe_json_list(
+        row["evidence_texts_json"]
+    )
+
+    evidence_details = None
+    if evidence_texts:
+        evidence_details = ui.tags.details(
+            ui.tags.summary("Transcript kanıtını göster"),
+            ui.tags.ul(
+                *[
+                    ui.tags.li(str(text))
+                    for text in evidence_texts
+                ]
+            ),
+            class_="evidence-details",
+        )
+
+    return ui.div(
+        ui.div(
+            ui.div(
+                f"{row['influencer_name']} incelemesi",
+                class_="review-entry-label",
+            ),
+            sentiment_pill(str(row["sentiment"])),
+            class_="review-entry-top",
+        ),
+        ui.div(
+            str(row["display_summary"]),
+            class_="review-summary",
+        ),
+        ui.div(
+            f"{format_date(row['upload_date'])} · "
+            f"Güven: {float(row['confidence']):.0%}",
+            class_="review-meta",
+        ),
+        ui.div(
+            str(row["video_title"]),
+            class_="review-meta",
+        ),
+        evidence_details,
+        ui.tags.a(
+            "Kaynak videoyu aç ↗",
+            href=row["video_url"],
+            target="_blank",
+            rel="noopener noreferrer",
+            class_="video-link",
+        ),
+        class_="review-entry",
+    )
+
+
+def product_card(
+    product: dict[str, Any],
+    *,
+    active_influencer: str,
+    cart_product_ids: set[int],
+) -> Any:
+    comments = get_product_comments(
+        product["product_id"],
+        active_influencer,
+    )
+
+    creator_map: dict[str, str] = {}
+    for comment in comments:
+        creator_map[str(comment["influencer_slug"])] = str(
+            comment["influencer_name"]
+        )
+
+    category_label = CATEGORY_LABELS.get(
+        product["category"],
+        product["category"],
+    )
+
+    if "match_score" in product:
+        badge = f"%{product['match_score']:.0f} eşleşme"
+    elif product["influencer_count"] >= 2:
+        badge = f"{product['influencer_count']} içerik üreticisi"
+    else:
+        badge = f"{product['comment_count']} yorum"
+
+    creator_buttons = [
+        ui.tags.button(
+            f"{creator_name} yorumunu gör",
+            type="button",
+            class_="creator-button",
+            onclick=js_set_input(
+                "review_request",
+                {
+                    "product_id": product["product_id"],
+                    "influencer_slug": creator_slug,
+                },
+            ),
+        )
+        for creator_slug, creator_name in sorted(
+            creator_map.items(),
+            key=lambda item: item[1].casefold(),
+        )
+    ]
+
+    in_cart = product["product_id"] in cart_product_ids
+
+    cart_attributes: dict[str, Any] = {
+        "type": "button",
+        "class_": (
+            "add-cart-button in-cart"
+            if in_cart
+            else "add-cart-button"
+        ),
+    }
+
+    if in_cart:
+        cart_attributes["disabled"] = "disabled"
+    else:
+        cart_attributes["onclick"] = js_set_input(
+            "cart_add",
+            {"product_id": product["product_id"]},
+        )
+
+    return ui.div(
+        ui.div(
+            ui.span(badge, class_="card-badge"),
+            ui.div(
+                product_initials(product["brand"]),
+                class_="product-monogram",
+            ),
+            class_="product-visual",
+        ),
+        ui.div(
+            ui.div(product["brand"], class_="product-brand"),
+            ui.h3(product["product_name"], class_="product-name"),
+            ui.p(category_label, class_="product-category"),
+            ui.div(
+                *creator_buttons,
+                class_="creator-actions",
+            ),
+            ui.div(
+                ui.tags.button(
+                    "Sepette ✓" if in_cart else "Sepete Ekle",
+                    **cart_attributes,
+                ),
+                class_="card-footer-actions",
+            ),
+            class_="product-card-body",
+        ),
+        class_="product-card",
+    )
+
+
+def category_tabs_ui(active_category: str) -> Any:
+    return ui.div(
+        *[
+            ui.tags.button(
+                label,
+                type="button",
+                class_=(
+                    "category-tab active"
+                    if code == active_category
+                    else "category-tab"
+                ),
+                onclick=js_set_input(
+                    "category_select",
+                    {"category": code},
+                ),
+            )
+            for code, label in CATEGORY_TABS.items()
+        ],
+        class_="category-strip",
+    )
+
+
+CUSTOM_CSS += """
+body {
+    background:
+        radial-gradient(circle at 6% 0%, rgba(255, 213, 223, 0.54), transparent 28rem),
+        linear-gradient(180deg, #fffdfd 0%, #f8f6f7 100%);
+}
+
+.commerce-shell {
+    width: min(1400px, calc(100% - 2rem));
+    margin: 0 auto;
+    padding: 1rem 0 4rem;
+}
+
+.topbar {
+    position: sticky;
+    top: 0.65rem;
+    z-index: 50;
+    display: grid;
+    grid-template-columns: minmax(190px, 0.52fr) minmax(340px, 1.75fr) auto;
+    align-items: center;
+    gap: 1rem;
+    padding: 0.85rem;
+    border: 1px solid rgba(238, 229, 232, 0.95);
+    border-radius: 22px;
+    background: rgba(255, 255, 255, 0.94);
+    box-shadow: 0 18px 45px rgba(67, 46, 55, 0.12);
+    backdrop-filter: blur(16px);
+}
+
+.brand-lockup {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    min-width: 0;
+    padding: 0 0.45rem;
+}
+
+.brand-mark {
+    display: grid;
+    place-items: center;
+    width: 42px;
+    height: 42px;
+    border-radius: 14px;
+    background: linear-gradient(145deg, #e35f7a, #a9304d);
+    box-shadow: 0 10px 22px rgba(201, 67, 98, 0.25);
+    color: white;
+    font-size: 1.2rem;
+}
+
+.brand-name {
+    margin: 0;
+    font-family: "Playfair Display", Didot, Georgia, serif;
+    font-size: 1.65rem;
+    font-weight: 650;
+    letter-spacing: -0.025em;
+    white-space: nowrap;
+}
+
+.demo-chip {
+    display: inline-flex;
+    margin-left: 0.3rem;
+    padding: 0.2rem 0.46rem;
+    border-radius: 999px;
+    background: #ffeaf0;
+    color: #a9304d;
+    font-family: Inter, sans-serif;
+    font-size: 0.66rem;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    vertical-align: middle;
+}
+
+.top-search {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 0.55rem;
+    min-width: 0;
+}
+
+.top-search .form-group,
+.top-search .shiny-input-container {
+    width: 100%;
+    margin: 0;
+}
+
+.top-search label {
+    display: none;
+}
+
+.top-search .selectize-control {
+    margin: 0;
+}
+
+.top-search .selectize-input {
+    min-height: 48px;
+    padding: 0.65rem 0.95rem !important;
+    border-radius: 14px !important;
+}
+
+.search-submit,
+.cart-trigger,
+.checkout-button {
+    border: 0 !important;
+    background: linear-gradient(135deg, #e35f7a, #a9304d) !important;
+    color: #fff !important;
+    box-shadow: 0 10px 22px rgba(201, 67, 98, 0.21);
+    font-weight: 800;
+}
+
+.search-submit {
+    min-height: 48px;
+    padding: 0 1.15rem;
+    border-radius: 14px !important;
+}
+
+.cart-trigger {
+    min-height: 46px;
+    padding: 0.62rem 0.95rem !important;
+    border-radius: 14px !important;
+    white-space: nowrap;
+}
+
+.category-strip {
+    display: flex;
+    gap: 0.55rem;
+    margin: 1rem 0 0;
+    padding: 0.8rem;
+    overflow-x: auto;
+    border: 1px solid #eee5e8;
+    border-radius: 18px;
+    background: rgba(255, 255, 255, 0.9);
+    box-shadow: 0 8px 24px rgba(67, 46, 55, 0.08);
+}
+
+.category-tab {
+    flex: 0 0 auto;
+    padding: 0.65rem 0.9rem;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    background: transparent;
+    color: #655a62;
+    font-weight: 750;
+    white-space: nowrap;
+}
+
+.category-tab:hover,
+.category-tab.active {
+    background: #ffeaf0;
+    color: #a9304d;
+}
+
+.filter-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    gap: 1rem;
+    margin: 1rem 0 1.3rem;
+    padding: 0.9rem 1rem;
+    border: 1px solid #eee5e8;
+    border-radius: 18px;
+    background: rgba(255, 255, 255, 0.86);
+}
+
+.filter-copy {
+    color: #655a62;
+    font-size: 0.9rem;
+    line-height: 1.5;
+}
+
+.influencer-filter {
+    width: min(310px, 100%);
+}
+
+.influencer-filter .form-group {
+    margin: 0;
+}
+
+.influencer-filter label {
+    margin-bottom: 0.35rem;
+    color: #655a62;
+    font-size: 0.78rem;
+    font-weight: 800;
+    text-transform: uppercase;
+}
+
+.section-heading {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    gap: 1rem;
+    margin: 1.2rem 0 1rem;
+}
+
+.section-heading h2 {
+    margin: 0;
+    font-size: clamp(1.45rem, 2.5vw, 2rem);
+}
+
+.section-heading p {
+    max-width: 680px;
+    margin: 0.35rem 0 0;
+    color: #655a62;
+}
+
+.result-count {
+    padding: 0.45rem 0.7rem;
+    border-radius: 999px;
+    background: #f0edef;
+    color: #655a62;
+    font-size: 0.82rem;
+    font-weight: 800;
+}
+
+.product-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 1rem;
+}
+
+.product-card {
+    display: flex;
+    min-height: 100%;
+    flex-direction: column;
+    overflow: hidden;
+    border: 1px solid #eee5e8;
+    border-radius: 20px;
+    background: white;
+    box-shadow: 0 8px 24px rgba(67, 46, 55, 0.08);
+    transition: 160ms ease;
+}
+
+.product-card:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 18px 45px rgba(67, 46, 55, 0.12);
+}
+
+.product-visual {
+    position: relative;
+    display: grid;
+    place-items: center;
+    min-height: 180px;
+    background:
+        radial-gradient(circle at 22% 18%, rgba(255,255,255,0.92), transparent 34%),
+        linear-gradient(145deg, #ffeaf0, #f5eff2 68%, #fff);
+}
+
+.product-monogram {
+    display: grid;
+    place-items: center;
+    width: 92px;
+    height: 112px;
+    border-radius: 28px 28px 20px 20px;
+    background: rgba(255,255,255,0.75);
+    box-shadow: 0 18px 35px rgba(169, 48, 77, 0.13);
+    color: #a9304d;
+    font-family: Georgia, serif;
+    font-size: 1.55rem;
+    font-weight: 800;
+}
+
+.card-badge {
+    position: absolute;
+    top: 0.8rem;
+    left: 0.8rem;
+    padding: 0.38rem 0.58rem;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.9);
+    color: #a9304d;
+    font-size: 0.72rem;
+    font-weight: 850;
+}
+
+.product-card-body {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    padding: 1rem;
+}
+
+.product-category {
+    margin: 0.5rem 0 0;
+    color: #8f838b;
+    font-size: 0.8rem;
+}
+
+.creator-actions {
+    display: grid;
+    gap: 0.45rem;
+    margin-top: 1rem;
+}
+
+.creator-button {
+    width: 100%;
+    padding: 0.58rem 0.65rem;
+    border: 1px solid #ffd5df;
+    border-radius: 11px;
+    background: #fff7f9;
+    color: #a9304d;
+    font-size: 0.79rem;
+    font-weight: 800;
+    text-align: left;
+}
+
+.creator-button:hover {
+    background: #ffeaf0;
+}
+
+.card-footer-actions {
+    margin-top: auto;
+    padding-top: 1rem;
+}
+
+.add-cart-button {
+    width: 100%;
+    padding: 0.72rem 0.8rem;
+    border: 0;
+    border-radius: 12px;
+    background: #221d21;
+    color: white;
+    font-weight: 850;
+}
+
+.add-cart-button:hover {
+    background: #a9304d;
+}
+
+.add-cart-button.in-cart,
+.add-cart-button:disabled {
+    background: #ece8ea;
+    color: #655a62;
+}
+
+.empty-card {
+    padding: 2.5rem 1.2rem;
+    border: 1px solid #eee5e8;
+    border-radius: 22px;
+    background: rgba(255,255,255,0.92);
+    text-align: center;
+}
+
+.empty-icon {
+    display: grid;
+    place-items: center;
+    width: 62px;
+    height: 62px;
+    margin: 0 auto 0.9rem;
+    border-radius: 20px;
+    background: #ffeaf0;
+    font-size: 1.7rem;
+}
+
+.review-entry {
+    margin-top: 0.85rem;
+    padding: 1rem;
+    border: 1px solid #eee5e8;
+    border-radius: 15px;
+    background: #fcf9fa;
+}
+
+.review-entry-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.65rem;
+}
+
+.review-entry-label {
+    color: #655a62;
+    font-size: 0.82rem;
+    font-weight: 850;
+}
+
+.review-summary {
+    padding: 0.85rem 0.95rem;
+    border-left: 4px solid #e35f7a;
+    border-radius: 0 12px 12px 0;
+    background: #fff7f9;
+    line-height: 1.65;
+}
+
+.review-meta {
+    margin-top: 0.58rem;
+    color: #8f838b;
+    font-size: 0.79rem;
+}
+
+.video-link {
+    display: inline-flex;
+    margin-top: 0.75rem;
+    padding: 0.5rem 0.7rem;
+    border-radius: 10px;
+    background: #f0edef;
+    color: #a9304d;
+    font-size: 0.82rem;
+    font-weight: 850;
+    text-decoration: none;
+}
+
+.cart-list {
+    display: grid;
+    gap: 0.7rem;
+}
+
+.cart-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 0.8rem;
+    align-items: center;
+    padding: 0.85rem;
+    border: 1px solid #eee5e8;
+    border-radius: 14px;
+    background: #fcf9fa;
+}
+
+.remove-cart-button {
+    padding: 0.45rem 0.6rem;
+    border: 1px solid #eee5e8;
+    border-radius: 9px;
+    background: white;
+    color: #655a62;
+}
+
+.cart-note,
+.payment-note {
+    margin-top: 1rem;
+    padding: 0.85rem;
+    border-radius: 12px;
+    background: #fff7f9;
+    color: #655a62;
+}
+
+.checkout-button {
+    padding: 0.65rem 0.9rem;
+    border-radius: 11px;
+}
+
+@media (max-width: 1120px) {
+    .product-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+}
+
+@media (max-width: 900px) {
+    .topbar {
+        position: static;
+        grid-template-columns: 1fr auto;
+    }
+
+    .top-search {
+        grid-column: 1 / -1;
+        grid-row: 2;
+    }
+
+    .product-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+@media (max-width: 650px) {
+    .commerce-shell {
+        width: min(100% - 1rem, 1400px);
+    }
+
+    .topbar {
+        grid-template-columns: minmax(0, 1fr) auto;
+    }
+
+    .demo-chip {
+        display: none;
+    }
+
+    .top-search {
+        grid-template-columns: 1fr;
+    }
+
+    .filter-row,
+    .section-heading {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    .influencer-filter {
+        width: 100%;
+    }
+
+    .product-grid {
+        grid-template-columns: 1fr;
+    }
+}
+"""
+
+
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
@@ -1004,70 +1898,64 @@ app_ui = ui.page_fluid(
     ui.div(
         ui.div(
             ui.div(
+                ui.div("S", class_="brand-mark"),
                 ui.h1(
-                    "Your Skinfluencer",
-                    style=(
-                        "font-family: 'Playfair Display', 'Didot', "
-                        "'Georgia', serif; font-weight: 600; "
-                        "letter-spacing: 1px; color: #333;"
-                    ),
+                    "Skinfluencer",
+                    ui.span("Demo", class_="demo-chip"),
+                    class_="brand-name",
                 ),
-                ui.p(
-                    "Kendine en uygun influencer'ı seç, ilgilendiğin "
-                    "ürünün gerçek yorumunu hemen gör."
-                ),
+                class_="brand-lockup",
             ),
-            ui.div("🎀", class_="hero-icon"),
-            class_="hero",
-        ),
-        ui.div(
             ui.div(
-                ui.input_select(
-                    "influencer",
-                    "Influencer",
-                    choices=INITIAL_INFLUENCERS,
-                    selected=(
-                        "naturally_serein"
-                        if "naturally_serein" in INITIAL_INFLUENCERS
-                        else next(iter(INITIAL_INFLUENCERS))
-                    ),
-                ),
                 ui.input_selectize(
                     "product_query",
-                    "Marka veya ürün adı",
+                    "",
                     choices={},
                     selected=None,
                     multiple=False,
                     options={
-                        "placeholder": (
-                            "Örn. Dr. Korea güneş kremi veya Round Lab"
-                        ),
+                        "placeholder": "Marka, ürün veya içerik ara...",
                         "create": True,
                         "createOnBlur": True,
                         "persist": False,
-                        "maxOptions": 150,
+                        "maxOptions": 180,
                         "closeAfterSelect": True,
-                        "selectOnTab": True,
                     },
                 ),
                 ui.input_action_button(
                     "search_button",
-                    "Yorumu göster",
-                    class_="btn-primary search-button",
+                    "Ara",
+                    class_="search-submit",
                 ),
-                class_="search-grid",
+                class_="top-search",
             ),
-            ui.p(
-                "İpucu: Marka adıyla, tam ürün adıyla veya yaklaşık bir "
-                "ifadeyle arayabilirsin. Küçük yazım hataları ve "
-                "“güneş kremi / sun cream” gibi ifadeler de eşleştirilir.",
-                class_="search-help",
+            ui.output_ui("cart_button"),
+            class_="topbar",
+        ),
+        ui.output_ui("category_navigation"),
+        ui.div(
+            ui.div(
+                ui.tags.strong(
+                    "Güvenilir ürün keşfi, gerçek video kanıtıyla."
+                ),
+                " Ürünleri inceleyin, içerik üreticisi yorumlarını "
+                "açın ve demo sepet akışını deneyin.",
+                class_="filter-copy",
             ),
-            class_="search-panel",
+            ui.div(
+                ui.input_select(
+                    "influencer",
+                    "İçerik üreticisi",
+                    choices=INITIAL_INFLUENCERS,
+                    selected="all",
+                ),
+                class_="influencer-filter",
+            ),
+            class_="filter-row",
         ),
         ui.output_ui("database_message"),
-        ui.output_ui("search_results"),
-        class_="app-shell",
+        ui.output_ui("catalog_content"),
+        class_="commerce-shell",
     ),
 )
 
@@ -1081,15 +1969,24 @@ def server(
     output: Outputs,
     session: Session,
 ) -> None:
+    active_category = reactive.Value("all")
+    submitted_query = reactive.Value("")
+    cart = reactive.Value({})
+
     @reactive.effect
     def update_product_suggestions() -> None:
         if not database_ready():
             return
 
-        catalog = get_product_catalog(input.influencer())
+        catalog = [
+            product
+            for product in get_commerce_catalog(input.influencer())
+            if product_matches_category(
+                product,
+                active_category.get(),
+            )
+        ]
 
-        # Brand is deliberately part of the visible label. Selectize searches
-        # option labels, so typing "Round Lab" now returns its products.
         choices = {
             str(product["product_id"]): (
                 f"{product['brand']} — {product['product_name']}"
@@ -1105,43 +2002,228 @@ def server(
             session=session,
         )
 
-    @reactive.calc
-    @reactive.event(
-        input.search_button,
-        ignore_none=False,
-    )
-    def product_search() -> dict[str, Any] | None:
-        raw_query = str(input.product_query() or "").strip()
-
-        if not raw_query:
-            return None
-
-        products = search_products(
-            raw_query,
-            input.influencer(),
-            limit=5,
-            score_cutoff=48.0,
+    @reactive.effect
+    @reactive.event(input.search_button)
+    def submit_search() -> None:
+        submitted_query.set(
+            str(input.product_query() or "").strip()
         )
 
-        results: list[dict[str, Any]] = []
+    @reactive.effect
+    @reactive.event(input.category_select)
+    def select_category() -> None:
+        payload = payload_as_dict(input.category_select())
+        category = str(payload.get("category") or "all")
 
-        for product in products:
-            comments = get_product_comments(
-                product["product_id"],
-                input.influencer(),
+        if category not in CATEGORY_TABS:
+            category = "all"
+
+        active_category.set(category)
+        submitted_query.set("")
+        ui.update_selectize(
+            "product_query",
+            selected="",
+            session=session,
+        )
+
+    @reactive.effect
+    @reactive.event(input.cart_add)
+    def add_to_cart() -> None:
+        payload = payload_as_dict(input.cart_add())
+        try:
+            product_id = int(payload["product_id"])
+        except (KeyError, TypeError, ValueError):
+            return
+
+        if get_product_by_id(product_id) is None:
+            return
+
+        updated = dict(cart.get())
+        updated[product_id] = 1
+        cart.set(updated)
+
+    def show_cart_modal() -> None:
+        current = dict(cart.get())
+
+        if not current:
+            body = ui.div(
+                ui.div("🛍️", class_="empty-icon"),
+                ui.h3("Sepetiniz henüz boş"),
+                ui.p(
+                    "Ürün kartlarındaki Sepete Ekle düğmesini "
+                    "kullanarak demo sepetinizi oluşturabilirsiniz."
+                ),
+                class_="empty-card",
             )
-            if comments:
-                results.append(
-                    {
-                        "product": product,
-                        "comments": comments,
-                    }
+            footer = ui.modal_button("Kapat")
+        else:
+            rows: list[Any] = []
+
+            for product_id in current:
+                product = get_product_by_id(product_id)
+                if product is None:
+                    continue
+
+                rows.append(
+                    ui.div(
+                        ui.div(
+                            ui.tags.strong(product["product_name"]),
+                            ui.tags.small(product["brand"]),
+                        ),
+                        ui.tags.button(
+                            "Kaldır",
+                            type="button",
+                            class_="remove-cart-button",
+                            onclick=js_set_input(
+                                "cart_remove",
+                                {"product_id": product_id},
+                            ),
+                        ),
+                        class_="cart-row",
+                    )
                 )
 
-        return {
-            "query": raw_query,
-            "results": results,
-        }
+            body = ui.div(
+                ui.div(*rows, class_="cart-list"),
+                ui.div(
+                    "Bu demo sürümünde fiyat, stok ve gerçek sipariş "
+                    "işlemi bulunmamaktadır.",
+                    class_="cart-note",
+                ),
+            )
+            footer = ui.div(
+                ui.tags.button(
+                    "Ödemeye Geç",
+                    type="button",
+                    class_="checkout-button",
+                    onclick=js_set_input(
+                        "checkout_request",
+                        {"requested": True},
+                    ),
+                ),
+                ui.modal_button("Alışverişe Devam Et"),
+            )
+
+        ui.modal_show(
+            ui.modal(
+                body,
+                title=f"Sepet ({len(current)})",
+                easy_close=True,
+                footer=footer,
+                size="l",
+            )
+        )
+
+    @reactive.effect
+    @reactive.event(input.open_cart)
+    def open_cart() -> None:
+        show_cart_modal()
+
+    @reactive.effect
+    @reactive.event(input.cart_remove)
+    def remove_from_cart() -> None:
+        payload = payload_as_dict(input.cart_remove())
+        try:
+            product_id = int(payload["product_id"])
+        except (KeyError, TypeError, ValueError):
+            return
+
+        updated = dict(cart.get())
+        updated.pop(product_id, None)
+        cart.set(updated)
+
+        ui.modal_remove()
+        show_cart_modal()
+
+    @reactive.effect
+    @reactive.event(input.checkout_request)
+    def checkout_demo() -> None:
+        ui.modal_remove()
+        ui.modal_show(
+            ui.modal(
+                ui.div(
+                    ui.div("✓", class_="empty-icon"),
+                    ui.h3("Demo ödeme deneyimi"),
+                    ui.p(
+                        "Bu adım yatırımcı ve kullanıcı deneyimi "
+                        "demosu için simüle edilmektedir."
+                    ),
+                    ui.div(
+                        "Gerçek ödeme, fiyatlandırma, stok kontrolü "
+                        "veya sipariş kaydı yapılmaz.",
+                        class_="payment-note",
+                    ),
+                    class_="empty-card",
+                ),
+                title="Ödemeye Geç",
+                easy_close=True,
+                footer=ui.modal_button("Kapat"),
+            )
+        )
+
+    @reactive.effect
+    @reactive.event(input.review_request)
+    def show_reviews() -> None:
+        payload = payload_as_dict(input.review_request())
+        try:
+            product_id = int(payload["product_id"])
+        except (KeyError, TypeError, ValueError):
+            return
+
+        influencer_slug = str(
+            payload.get("influencer_slug") or "all"
+        )
+        product = get_product_by_id(product_id)
+        if product is None:
+            return
+
+        comments = get_product_comments(
+            product_id,
+            influencer_slug,
+        )
+        if not comments:
+            return
+
+        influencer_name = str(comments[0]["influencer_name"])
+
+        ui.modal_show(
+            ui.modal(
+                ui.div(
+                    ui.div(
+                        ui.div(
+                            product["brand"],
+                            class_="product-brand",
+                        ),
+                        ui.h3(product["product_name"]),
+                        ui.div(
+                            f"{influencer_name} · "
+                            f"{len(comments)} onaylı inceleme",
+                            class_="review-meta",
+                        ),
+                    ),
+                    *[
+                        review_entry(comment)
+                        for comment in comments
+                    ],
+                ),
+                title=f"{influencer_name} yorumları",
+                easy_close=True,
+                footer=ui.modal_button("Kapat"),
+                size="l",
+            )
+        )
+
+    @render.ui
+    def cart_button() -> Any:
+        return ui.input_action_button(
+            "open_cart",
+            f"Sepet ({len(cart.get())})",
+            class_="cart-trigger",
+        )
+
+    @render.ui
+    def category_navigation() -> Any:
+        return category_tabs_ui(active_category.get())
 
     @render.ui
     def database_message() -> Any:
@@ -1149,63 +2231,92 @@ def server(
             return None
 
         return ui.div(
-            ui.div("⚠️", class_="status-icon"),
+            ui.div("⚠️", class_="empty-icon"),
             ui.h3("Veritabanı bulunamadı"),
             ui.p(
-                f"Önce SQLite importer'ı çalıştır: {DB_PATH}"
+                f"Önce SQLite importer'ı çalıştırın: {DB_PATH}"
             ),
-            class_="status-card",
+            class_="empty-card",
         )
 
     @render.ui
-    def search_results() -> Any:
+    def catalog_content() -> Any:
         if not database_ready():
             return None
 
-        response = product_search()
+        influencer_slug = input.influencer()
+        category = active_category.get()
+        query = submitted_query.get()
+        cart_ids = set(cart.get().keys())
 
-        if response is None:
-            return ui.div(
-                ui.div("✨", class_="status-icon"),
-                ui.h3("Bir ürün seçerek başlayın"),
-                ui.p(
-                    "Influencer'ı seçin, marka veya ürün adını yazın. "
-                    "Listeden seçim yapabilir ya da kendi arama ifadenizi "
-                    "yazıp Yorumu göster düğmesine basabilirsiniz."
-                ),
-                class_="status-card",
+        if query:
+            products = search_products_commerce(
+                query,
+                influencer_slug,
+                category,
+                limit=24,
+            )
+            heading = f"“{query}” için sonuçlar"
+            description = (
+                "En güçlü marka ve ürün eşleşmeleri önce gösteriliyor."
+            )
+        elif category == "all":
+            products = browse_products(
+                influencer_slug,
+                "skincare",
+                limit=12,
+            )
+            heading = "En Çok Satan Cilt Bakımı Ürünleri"
+            description = (
+                "Gerçek satış verisi yerine yorum yoğunluğu ve içerik "
+                "üreticisi kapsamına göre hazırlanmıştır."
+            )
+        else:
+            products = browse_products(
+                influencer_slug,
+                category,
+                limit=24,
+            )
+            heading = CATEGORY_TABS[category]
+            description = (
+                "Onaylanmış influencer yorumlarına sahip ürünler "
+                "öne çıkarılıyor."
             )
 
-        results = response["results"]
-
-        if not results:
+        if not products:
             return ui.div(
-                ui.div("🔎", class_="status-icon"),
+                ui.div("🔎", class_="empty-icon"),
                 ui.h3("Ürün bulunamadı"),
                 ui.p(
-                    f"“{response['query']}” için yeterince güçlü bir "
-                    "eşleşme bulunamadı."
+                    "Bu arama ve filtre kombinasyonu için yeterince "
+                    "güçlü bir eşleşme bulunamadı."
                 ),
-                class_="status-card",
+                class_="empty-card",
             )
 
         return ui.div(
             ui.div(
-                ui.h3(
-                    f"{len(results)} ürün eşleşmesi bulundu"
+                ui.div(
+                    ui.h2(heading),
+                    ui.p(description),
                 ),
-                ui.p(
-                    "En güçlü marka ve ürün eşleşmeleri önce gösteriliyor."
+                ui.div(
+                    f"{len(products)} ürün",
+                    class_="result-count",
                 ),
-                class_="results-heading",
+                class_="section-heading",
             ),
-            *[
-                result_card(
-                    result["product"],
-                    result["comments"],
-                )
-                for result in results
-            ],
+            ui.div(
+                *[
+                    product_card(
+                        product,
+                        active_influencer=influencer_slug,
+                        cart_product_ids=cart_ids,
+                    )
+                    for product in products
+                ],
+                class_="product-grid",
+            ),
         )
 
 
